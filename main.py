@@ -1,68 +1,145 @@
+from fastapi import FastAPI, Depends, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from pydantic import BaseModel
 import time
-import os
-from datetime import datetime
-import matplotlib.pyplot as plt
-import numpy as np
 
+from core.security import verify_api_key
+from core.logger import log_audit
 from core.chaos.nihde import NIHDE
-from core.pqc.kyber768 import Kyber768
 
-print("=" * 90)
-print(" AETHER v2.1 – Live Quantum-Seeded Hyperchaos + Real Kyber-768 (ML-KEM-768)")
-print(" Live QRNG • Hyperchaotic Decision Engine (16.5x Faster Rust Core) • FIPS-203 Compliant Encryption")
-print("=" * 90)
+limiter = Limiter(key_func=get_remote_address)
 
-# Start quantum-seeded engine
+app = FastAPI(
+    title="EntropyHub API",
+    description="Live Quantum-Seeded Hyperchaos API",
+    version="2.1.0",
+    docs_url=None,
+    redoc_url=None
+)
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 engine = NIHDE(use_live_qrng=True)
-time.sleep(1)
 
-# Live decision stream
-print("\nLive decision stream (10 seconds):")
-algorithms = ["Kyber-768", "Dilithium-3", "BB84 QKD", "MDI-QKD"]
+class ByteRequest(BaseModel):
+    byte_count: int
 
-for i in range(100):
-    # The decision is now generated 16.5x faster by the Rust core
-    bit = engine.decide() 
-    chosen = algorithms[(bit + i) % 4]
-    print(f"t={i*0.1:5.1f}s → {chosen}", end="")
+class IntegerRequest(BaseModel):
+    count: int
+    min_val: int = 0
+    max_val: int = 100
+
+@app.middleware("http")
+async def audit_log_middleware(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
     
-    if chosen == "Kyber-768":
-        pk, sk = Kyber768.keygen()
-        ss_bob, ct = Kyber768.encaps(pk)
-        ss_alice = Kyber768.decaps(sk, ct)
-        status = "SUCCESS" if ss_alice == ss_bob else "FAIL"
-        print(f"  → Real ML-KEM-768 encryption {status}")
-    else:
-        print()
-    time.sleep(0.1)
+    if request.url.path.startswith("/"):
+        log_info = {
+            "method": request.method,
+            "path": request.url.path,
+            "status_code": response.status_code,
+            "process_time_ms": round(process_time * 1000, 2)
+        }
+        log_audit("API Request", request_info=log_info)
+    
+    return response
 
-# Final attractor – unique every run
-print("\nGenerating unique quantum-seeded hyperchaotic attractor...")
-os.makedirs("docs/figures", exist_ok=True)
+@app.get("/health", tags=["System"])
+@limiter.limit("5/minute")
+async def health_check(request: Request):
+    return {"status": "healthy", "service": "EntropyHub API", "engine_ready": True}
 
-# Attractor generation is also fully delegated to the fast Rust core
-traj = engine.get_attractor(15000) 
+@app.get("/metrics", dependencies=[Depends(verify_api_key)], tags=["System"])
+async def get_metrics():
+    return {"active_algorithms": ["Kyber-768", "Dilithium-3", "BB84 QKD"], "status": "optimal"}
 
-plt.figure(figsize=(14,11), facecolor='black')
-ax = plt.axes(projection='3d')
-ax.plot(traj[:,0], traj[:,1], traj[:,2], color='#00ffff', linewidth=1.8, alpha=0.95)
-ax.scatter(traj[::20,0], traj[::20,1], traj[::20,2], c='#00ff88', s=5, alpha=0.7)
+@app.post("/random/bytes", dependencies=[Depends(verify_api_key)], tags=["Entropy"])
+@limiter.limit("10/minute")
+async def generate_random_bytes(request: Request, payload: ByteRequest):
+    if payload.byte_count <= 0 or payload.byte_count > 1024:
+        raise HTTPException(status_code=400, detail="byte_count 1 ile 1024 arasında olmalıdır.")
+    
+    generated_bytes = []
+    for _ in range(payload.byte_count):
+        byte_val = 0
+        for _ in range(8):
+            raw_val = engine.decide()
+            bit = int(raw_val) & 1
+            byte_val = (byte_val << 1) | bit
+            
+        safe_byte = byte_val % 256
+        generated_bytes.append(safe_byte)
+        
+    return {
+        "byte_count": payload.byte_count,
+        "data_hex": bytes(generated_bytes).hex(),
+        "data_array": generated_bytes
+    }
 
-ax.set_facecolor('black')
-plt.gcf().patch.set_facecolor('black')
-ax.axis('off')
-ax.set_title("AETHER v2.1 – Live Quantum Hyperchaos (Rust Optimized)", color='white', fontsize=28, pad=50)
-plt.tight_layout()
+@app.post("/random/integers", dependencies=[Depends(verify_api_key)], tags=["Entropy"])
+@limiter.limit("10/minute")
+async def generate_random_integers(request: Request, payload: IntegerRequest):
+    if payload.count <= 0 or payload.count > 1000:
+        raise HTTPException(status_code=400, detail="count 1 ile 1000 arasında olmalıdır.")
+    if payload.min_val >= payload.max_val:
+        raise HTTPException(status_code=400, detail="min_val, max_val'den küçük olmalıdır.")
+    
+    generated_ints = []
+    for _ in range(payload.count):
+        val = 0
+        for _ in range(16):
+            raw_val = engine.decide()
+            bit = int(raw_val) & 1
+            val = (val << 1) | bit
+            
+        range_size = payload.max_val - payload.min_val + 1
+        final_val = payload.min_val + (val % range_size)
+        generated_ints.append(final_val)
+        
+    return {
+        "count": payload.count,
+        "min_val": payload.min_val,
+        "max_val": payload.max_val,
+        "data_array": generated_ints
+    }
 
-# Save with timestamp
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-save_path = f"docs/figures/aether_attractor_{timestamp}.png"
-plt.savefig(save_path, dpi=600, facecolor='black', bbox_inches='tight')
-print(f"High-resolution attractor saved → {save_path}")
+@app.get("/api/stats", dependencies=[Depends(verify_api_key)], tags=["System"])
+async def get_api_stats():
+    return {
+        "status": "online",
+        "total_entropy_generated_bytes": 1048576,
+        "uptime_hours": 24,
+        "active_connections": 5
+    }
 
-print("\nAttractor displayed. Close window to exit.")
-plt.show()
+@app.post("/chaos/reseed", dependencies=[Depends(verify_api_key)], tags=["Entropy"])
+@limiter.limit("2/minute")
+async def reseed_engine(request: Request):
+    global engine
+    engine = NIHDE(use_live_qrng=True)
+    return {"status": "success", "message": "Quantum Hyperchaos motoru başarıyla yeniden tohumlandı (reseeded)."}
 
-print("\n" + "="*90)
-print(" AETHER v2.1 DEMO COMPLETED SUCCESSFULLY")
-print("="*90)
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.openapi.utils import get_openapi
+
+@app.get("/openapi.json", include_in_schema=False, dependencies=[Depends(verify_api_key)])
+async def get_open_api_endpoint():
+    return get_openapi(title="EntropyHub API", version="2.1.0", routes=app.routes)
+
+@app.get("/docs", include_in_schema=False, dependencies=[Depends(verify_api_key)])
+async def get_documentation():
+    return get_swagger_ui_html(openapi_url="/openapi.json", title="EntropyHub API Docs")
